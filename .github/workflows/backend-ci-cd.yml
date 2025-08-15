@@ -1,0 +1,408 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend-ci-cd.yml'
+      - 'shared/**'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend-ci-cd.yml'
+      - 'shared/**'
+
+env:
+  NODE_VERSION: '18'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: fitcoach-backend
+
+jobs:
+  # ==============================================
+  # TESTES E QUALIDADE DE CÓDIGO
+  # ==============================================
+  test:
+    name: Tests & Code Quality
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: fitcoach_test
+        options: >
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: ./backend
+        run: npm ci
+      
+      - name: Install shared dependencies
+        working-directory: ./shared
+        run: npm ci
+      
+      - name: Lint code
+        working-directory: ./backend
+        run: npm run lint
+      
+      - name: Type check
+        working-directory: ./backend
+        run: npm run type-check
+      
+      - name: Run unit tests
+        working-directory: ./backend
+        run: npm run test:unit
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/fitcoach_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-jwt-secret-key-for-ci-cd-pipeline
+          JWT_REFRESH_SECRET: test-refresh-secret-key-for-ci-cd-pipeline
+      
+      - name: Run integration tests
+        working-directory: ./backend
+        run: npm run test:integration
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/fitcoach_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-jwt-secret-key-for-ci-cd-pipeline
+          JWT_REFRESH_SECRET: test-refresh-secret-key-for-ci-cd-pipeline
+      
+      - name: Generate test coverage
+        working-directory: ./backend
+        run: npm run test:coverage
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/fitcoach_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-jwt-secret-key-for-ci-cd-pipeline
+          JWT_REFRESH_SECRET: test-refresh-secret-key-for-ci-cd-pipeline
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./backend/coverage/lcov.info
+          flags: backend
+          name: backend-coverage
+          fail_ci_if_error: false
+      
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: backend
+
+  # ==============================================
+  # SECURITY SCAN
+  # ==============================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./backend
+        run: npm ci
+      
+      - name: Run security audit
+        working-directory: ./backend
+        run: npm audit --audit-level=high
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --file=backend/package.json
+      
+      - name: Upload Snyk results to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
+  # ==============================================
+  # BUILD DOCKER IMAGE
+  # ==============================================
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.event_name == 'push'
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  # ==============================================
+  # DEPLOY TO STAGING
+  # ==============================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://fitcoach-api-staging.railway.app
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to Railway (Staging)
+        uses: railway-app/railway-action@v1
+        with:
+          api-token: ${{ secrets.RAILWAY_TOKEN_STAGING }}
+          project-id: ${{ secrets.RAILWAY_PROJECT_ID_STAGING }}
+          service-id: ${{ secrets.RAILWAY_SERVICE_ID_BACKEND_STAGING }}
+      
+      - name: Run database migrations
+        run: |
+          curl -X POST "https://fitcoach-api-staging.railway.app/api/admin/migrate" \
+            -H "Authorization: Bearer ${{ secrets.ADMIN_API_KEY_STAGING }}" \
+            -H "Content-Type: application/json"
+      
+      - name: Run smoke tests
+        run: |
+          sleep 30  # Wait for deployment
+          curl -f "https://fitcoach-api-staging.railway.app/api/health" || exit 1
+          curl -f "https://fitcoach-api-staging.railway.app/api/health/database" || exit 1
+      
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+
+  # ==============================================
+  # DEPLOY TO PRODUCTION
+  # ==============================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://api.fitcoach.pro
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to Railway (Production)
+        uses: railway-app/railway-action@v1
+        with:
+          api-token: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
+          project-id: ${{ secrets.RAILWAY_PROJECT_ID_PRODUCTION }}
+          service-id: ${{ secrets.RAILWAY_SERVICE_ID_BACKEND_PRODUCTION }}
+      
+      - name: Run database migrations
+        run: |
+          curl -X POST "https://api.fitcoach.pro/api/admin/migrate" \
+            -H "Authorization: Bearer ${{ secrets.ADMIN_API_KEY_PRODUCTION }}" \
+            -H "Content-Type: application/json"
+      
+      - name: Run smoke tests
+        run: |
+          sleep 60  # Wait for deployment
+          curl -f "https://api.fitcoach.pro/api/health" || exit 1
+          curl -f "https://api.fitcoach.pro/api/health/database" || exit 1
+      
+      - name: Create GitHub Release
+        if: success()
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: backend-v${{ github.run_number }}
+          release_name: Backend Release v${{ github.run_number }}
+          body: |
+            ## Backend Release v${{ github.run_number }}
+            
+            **Deployed to Production**: https://api.fitcoach.pro
+            **Docker Image**: ${{ needs.build.outputs.image-tag }}
+            **Commit**: ${{ github.sha }}
+            
+            ### Changes
+            ${{ github.event.head_commit.message }}
+          draft: false
+          prerelease: false
+      
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+          custom_payload: |
+            {
+              "text": "🚀 Backend deployed to Production!",
+              "attachments": [{
+                "color": "${{ job.status == 'success' && 'good' || 'danger' }}",
+                "fields": [{
+                  "title": "Status",
+                  "value": "${{ job.status }}",
+                  "short": true
+                }, {
+                  "title": "Environment",
+                  "value": "Production",
+                  "short": true
+                }, {
+                  "title": "URL",
+                  "value": "https://api.fitcoach.pro",
+                  "short": false
+                }]
+              }]
+            }
+
+  # ==============================================
+  # PERFORMANCE TESTS
+  # ==============================================
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install Artillery
+        run: npm install -g artillery@latest
+      
+      - name: Run load tests
+        run: |
+          artillery run tests/performance/api-load-test.yml \
+            --target https://fitcoach-api-staging.railway.app \
+            --output performance-report.json
+      
+      - name: Generate performance report
+        run: artillery report performance-report.json --output performance-report.html
+      
+      - name: Upload performance report
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-report
+          path: performance-report.html
+      
+      - name: Comment PR with performance results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('performance-report.json', 'utf8'));
+            const summary = report.aggregate;
+            
+            const comment = `## 🚀 Performance Test Results
+            
+            | Metric | Value |
+            |--------|-------|
+            | Total Requests | ${summary.counters['http.requests'] || 'N/A'} |
+            | Success Rate | ${((summary.counters['http.responses'] / summary.counters['http.requests']) * 100).toFixed(2)}% |
+            | Average Response Time | ${summary.latency?.mean?.toFixed(2) || 'N/A'}ms |
+            | 95th Percentile | ${summary.latency?.p95?.toFixed(2) || 'N/A'}ms |
+            | 99th Percentile | ${summary.latency?.p99?.toFixed(2) || 'N/A'}ms |
+            
+            [📊 Full Performance Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

@@ -1,0 +1,178 @@
+version: '3.8'
+
+services:
+  # ==============================================
+  # BANCO DE DADOS - PostgreSQL
+  # ==============================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: fitcoach-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fitcoach_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-fitcoach_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fitcoach_password}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - fitcoach-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fitcoach_user} -d ${POSTGRES_DB:-fitcoach_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==============================================
+  # CACHE - Redis
+  # ==============================================
+  redis:
+    image: redis:7-alpine
+    container_name: fitcoach-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_password} --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - fitcoach-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ==============================================
+  # BACKEND API
+  # ==============================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: fitcoach-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://${POSTGRES_USER:-fitcoach_user}:${POSTGRES_PASSWORD:-fitcoach_password}@postgres:5432/${POSTGRES_DB:-fitcoach_dev}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379
+      PORT: 3001
+      JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-key-min-32-chars}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev-refresh-secret-key-min-32-chars}
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - ./uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - fitcoach-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==============================================
+  # FRONTEND WEB
+  # ==============================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: fitcoach-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: http://localhost:3001
+      VITE_APP_NAME: FitCoach Pro
+      VITE_ENVIRONMENT: development
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - fitcoach-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==============================================
+  # ADMINER - Interface do Banco
+  # ==============================================
+  adminer:
+    image: adminer:4.8.1
+    container_name: fitcoach-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: pepa-linha
+    depends_on:
+      - postgres
+    networks:
+      - fitcoach-network
+
+  # ==============================================
+  # REDIS COMMANDER - Interface do Redis
+  # ==============================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: fitcoach-redis-commander
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: local:redis:6379:0:${REDIS_PASSWORD:-redis_password}
+      HTTP_USER: admin
+      HTTP_PASSWORD: admin
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - fitcoach-network
+
+  # ==============================================
+  # MAILHOG - Email Testing
+  # ==============================================
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: fitcoach-mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+    networks:
+      - fitcoach-network
+
+# ==============================================
+# VOLUMES
+# ==============================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ==============================================
+# NETWORKS
+# ==============================================
+networks:
+  fitcoach-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

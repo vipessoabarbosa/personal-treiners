@@ -1,0 +1,567 @@
+name: Mobile CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-ci-cd.yml'
+      - 'shared/**'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-ci-cd.yml'
+      - 'shared/**'
+
+env:
+  NODE_VERSION: '18'
+  EXPO_CLI_VERSION: 'latest'
+
+jobs:
+  # ==============================================
+  # TESTES E QUALIDADE DE CÓDIGO
+  # ==============================================
+  test:
+    name: Tests & Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+      
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli@${{ env.EXPO_CLI_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+      
+      - name: Install shared dependencies
+        working-directory: ./shared
+        run: npm ci
+      
+      - name: Lint code
+        working-directory: ./mobile
+        run: npm run lint
+      
+      - name: Type check
+        working-directory: ./mobile
+        run: npm run type-check
+      
+      - name: Run unit tests
+        working-directory: ./mobile
+        run: npm run test:unit
+        env:
+          EXPO_PUBLIC_API_URL: http://localhost:3001
+          EXPO_PUBLIC_APP_NAME: FitCoach Pro
+          EXPO_PUBLIC_ENVIRONMENT: test
+      
+      - name: Generate test coverage
+        working-directory: ./mobile
+        run: npm run test:coverage
+        env:
+          EXPO_PUBLIC_API_URL: http://localhost:3001
+          EXPO_PUBLIC_APP_NAME: FitCoach Pro
+          EXPO_PUBLIC_ENVIRONMENT: test
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./mobile/coverage/lcov.info
+          flags: mobile
+          name: mobile-coverage
+          fail_ci_if_error: false
+      
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: mobile
+
+  # ==============================================
+  # BUILD E VALIDAÇÃO
+  # ==============================================
+  build:
+    name: Build & Validation
+    runs-on: ubuntu-latest
+    needs: [test]
+    
+    strategy:
+      matrix:
+        platform: [ios, android]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+      
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli@${{ env.EXPO_CLI_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+      
+      - name: Expo Doctor
+        working-directory: ./mobile
+        run: npx expo doctor
+      
+      - name: Validate app.json
+        working-directory: ./mobile
+        run: |
+          if ! npx expo config --type public > /dev/null 2>&1; then
+            echo "❌ app.json validation failed"
+            exit 1
+          fi
+          echo "✅ app.json is valid"
+      
+      - name: Pre-build for ${{ matrix.platform }}
+        working-directory: ./mobile
+        run: npx expo prebuild --platform ${{ matrix.platform }} --no-install
+        env:
+          EXPO_PUBLIC_API_URL: https://fitcoach-api-staging.railway.app
+          EXPO_PUBLIC_APP_NAME: FitCoach Pro
+          EXPO_PUBLIC_ENVIRONMENT: staging
+      
+      - name: Upload prebuild artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: prebuild-${{ matrix.platform }}
+          path: |
+            mobile/ios
+            mobile/android
+          retention-days: 7
+
+  # ==============================================
+  # SECURITY SCAN
+  # ==============================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+      
+      - name: Run security audit
+        working-directory: ./mobile
+        run: npm audit --audit-level=high
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --file=mobile/package.json
+      
+      - name: Upload Snyk results to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
+  # ==============================================
+  # BUILD PREVIEW (EXPO DEVELOPMENT BUILD)
+  # ==============================================
+  build-preview:
+    name: Build Preview
+    runs-on: ubuntu-latest
+    needs: [build, security]
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+      
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli@${{ env.EXPO_CLI_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+      
+      - name: Setup EAS CLI
+        run: npm install -g eas-cli
+      
+      - name: Authenticate with Expo
+        run: eas login --non-interactive
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      
+      - name: Build development build
+        working-directory: ./mobile
+        run: |
+          eas build --platform all --profile development --non-interactive --wait
+        env:
+          EXPO_PUBLIC_API_URL: https://fitcoach-api-staging.railway.app
+          EXPO_PUBLIC_APP_NAME: FitCoach Pro (Dev)
+          EXPO_PUBLIC_ENVIRONMENT: staging
+      
+      - name: Generate QR codes for testing
+        working-directory: ./mobile
+        run: |
+          echo "## 📱 Development Build Ready!" > build-info.md
+          echo "" >> build-info.md
+          echo "### Download Links" >> build-info.md
+          eas build:list --platform=all --status=finished --limit=1 --json | jq -r '.[] | "- **" + .platform + "**: [Download](" + .artifacts.buildUrl + ")"' >> build-info.md
+          echo "" >> build-info.md
+          echo "### QR Codes" >> build-info.md
+          echo "Scan with Expo Go or Camera app:" >> build-info.md
+          echo "" >> build-info.md
+          npx expo start --dev-client --tunnel --non-interactive &
+          sleep 10
+          npx expo start --dev-client --tunnel --non-interactive --print-qr >> build-info.md
+      
+      - name: Comment PR with build info
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const buildInfo = fs.readFileSync('./mobile/build-info.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: buildInfo
+            });
+
+  # ==============================================
+  # PUBLISH TO EXPO (STAGING)
+  # ==============================================
+  publish-staging:
+    name: Publish to Expo (Staging)
+    runs-on: ubuntu-latest
+    needs: [build-preview]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: mobile-staging
+      url: https://expo.dev/@fitcoach/fitcoach-pro
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+      
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli@${{ env.EXPO_CLI_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+      
+      - name: Authenticate with Expo
+        run: npx expo login --non-interactive
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      
+      - name: Publish update
+        working-directory: ./mobile
+        run: |
+          npx expo publish --release-channel=staging --non-interactive
+        env:
+          EXPO_PUBLIC_API_URL: https://fitcoach-api-staging.railway.app
+          EXPO_PUBLIC_APP_NAME: FitCoach Pro (Staging)
+          EXPO_PUBLIC_ENVIRONMENT: staging
+      
+      - name: Generate staging QR code
+        working-directory: ./mobile
+        run: |
+          echo "📱 **Mobile App Published to Staging!**" > staging-info.md
+          echo "" >> staging-info.md
+          echo "**Release Channel**: staging" >> staging-info.md
+          echo "**Environment**: Staging" >> staging-info.md
+          echo "**Commit**: ${{ github.sha }}" >> staging-info.md
+          echo "" >> staging-info.md
+          echo "### Test with Expo Go" >> staging-info.md
+          echo "1. Install [Expo Go](https://expo.dev/client) on your device" >> staging-info.md
+          echo "2. Scan the QR code below or visit: https://expo.dev/@fitcoach/fitcoach-pro?release-channel=staging" >> staging-info.md
+          echo "" >> staging-info.md
+          npx expo url --type=exp --release-channel=staging
+      
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#mobile-deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+
+  # ==============================================
+  # BUILD PRODUCTION
+  # ==============================================
+  build-production:
+    name: Build Production
+    runs-on: ubuntu-latest
+    needs: [build, security]
+    if: github.ref == 'refs/heads/main'
+    
+    strategy:
+      matrix:
+        platform: [ios, android]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+      
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli@${{ env.EXPO_CLI_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+      
+      - name: Setup EAS CLI
+        run: npm install -g eas-cli
+      
+      - name: Authenticate with Expo
+        run: eas login --non-interactive
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      
+      - name: Build for ${{ matrix.platform }} store
+        working-directory: ./mobile
+        run: |
+          eas build --platform ${{ matrix.platform }} --profile production --non-interactive --wait
+        env:
+          EXPO_PUBLIC_API_URL: https://api.fitcoach.pro
+          EXPO_PUBLIC_APP_NAME: FitCoach Pro
+          EXPO_PUBLIC_ENVIRONMENT: production
+      
+      - name: Download build artifacts
+        working-directory: ./mobile
+        run: |
+          mkdir -p builds
+          eas build:list --platform=${{ matrix.platform }} --status=finished --limit=1 --json | jq -r '.[0].artifacts.buildUrl' | xargs wget -O builds/fitcoach-${{ matrix.platform }}.$([ "${{ matrix.platform }}" = "ios" ] && echo "ipa" || echo "apk")
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: production-build-${{ matrix.platform }}
+          path: mobile/builds/
+          retention-days: 30
+
+  # ==============================================
+  # PUBLISH TO STORES (MANUAL APPROVAL)
+  # ==============================================
+  publish-stores:
+    name: Publish to App Stores
+    runs-on: ubuntu-latest
+    needs: [build-production]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: mobile-production
+      url: https://apps.apple.com/app/fitcoach-pro
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Setup EAS CLI
+        run: npm install -g eas-cli
+      
+      - name: Authenticate with Expo
+        run: eas login --non-interactive
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      
+      - name: Submit to App Store
+        working-directory: ./mobile
+        run: |
+          eas submit --platform ios --latest --non-interactive
+        env:
+          EXPO_APPLE_ID: ${{ secrets.EXPO_APPLE_ID }}
+          EXPO_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.EXPO_APPLE_APP_SPECIFIC_PASSWORD }}
+      
+      - name: Submit to Google Play
+        working-directory: ./mobile
+        run: |
+          eas submit --platform android --latest --non-interactive
+        env:
+          EXPO_ANDROID_KEYSTORE_PATH: ${{ secrets.EXPO_ANDROID_KEYSTORE_PATH }}
+          EXPO_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.EXPO_ANDROID_KEYSTORE_PASSWORD }}
+          EXPO_ANDROID_KEY_PASSWORD: ${{ secrets.EXPO_ANDROID_KEY_PASSWORD }}
+      
+      - name: Create GitHub Release
+        if: success()
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: mobile-v${{ github.run_number }}
+          release_name: Mobile Release v${{ github.run_number }}
+          body: |
+            ## Mobile Release v${{ github.run_number }}
+            
+            **Submitted to App Stores**
+            - 🍎 App Store: Pending Review
+            - 🤖 Google Play: Pending Review
+            
+            **Commit**: ${{ github.sha }}
+            
+            ### Changes
+            ${{ github.event.head_commit.message }}
+            
+            ### Download Links
+            - [iOS Build](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            - [Android Build](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          draft: false
+          prerelease: false
+      
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#mobile-deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          custom_payload: |
+            {
+              "text": "📱 Mobile app submitted to stores!",
+              "attachments": [{
+                "color": "${{ job.status == 'success' && 'good' || 'danger' }}",
+                "fields": [{
+                  "title": "Status",
+                  "value": "${{ job.status }}",
+                  "short": true
+                }, {
+                  "title": "Environment",
+                  "value": "Production",
+                  "short": true
+                }, {
+                  "title": "Stores",
+                  "value": "App Store & Google Play",
+                  "short": false
+                }]
+              }]
+            }
+
+  # ==============================================
+  # PUBLISH OTA UPDATE
+  # ==============================================
+  publish-ota:
+    name: Publish OTA Update
+    runs-on: ubuntu-latest
+    needs: [build-production]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: mobile-ota-production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+      
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli@${{ env.EXPO_CLI_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./mobile
+        run: npm ci
+      
+      - name: Authenticate with Expo
+        run: npx expo login --non-interactive
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      
+      - name: Publish OTA update
+        working-directory: ./mobile
+        run: |
+          npx expo publish --release-channel=production --non-interactive
+        env:
+          EXPO_PUBLIC_API_URL: https://api.fitcoach.pro
+          EXPO_PUBLIC_APP_NAME: FitCoach Pro
+          EXPO_PUBLIC_ENVIRONMENT: production
+      
+      - name: Notify users about update
+        run: |
+          echo "🚀 OTA Update published successfully!"
+          echo "Users will receive the update automatically when they restart the app."
+      
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#mobile-deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          custom_payload: |
+            {
+              "text": "🔄 OTA Update published!",
+              "attachments": [{
+                "color": "good",
+                "fields": [{
+                  "title": "Release Channel",
+                  "value": "production",
+                  "short": true
+                }, {
+                  "title": "Update Type",
+                  "value": "Over-The-Air (OTA)",
+                  "short": true
+                }, {
+                  "title": "Rollout",
+                  "value": "Automatic on app restart",
+                  "short": false
+                }]
+              }]
+            }

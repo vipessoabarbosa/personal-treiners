@@ -1,0 +1,517 @@
+name: Full Stack CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      components:
+        description: 'Components to deploy (comma-separated)'
+        required: false
+        default: 'backend,frontend,mobile'
+        type: string
+
+env:
+  NODE_VERSION: '18'
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+
+jobs:
+  # ==============================================
+  # DETECT CHANGES
+  # ==============================================
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.changes.outputs.backend }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+      mobile: ${{ steps.changes.outputs.mobile }}
+      shared: ${{ steps.changes.outputs.shared }}
+      docs: ${{ steps.changes.outputs.docs }}
+      infrastructure: ${{ steps.changes.outputs.infrastructure }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Detect changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+              - 'shared/**'
+              - 'docker/postgres/**'
+              - 'docker/redis/**'
+            frontend:
+              - 'frontend/**'
+              - 'shared/**'
+            mobile:
+              - 'mobile/**'
+              - 'shared/**'
+            shared:
+              - 'shared/**'
+            docs:
+              - 'docs/**'
+              - '*.md'
+            infrastructure:
+              - '.github/workflows/**'
+              - 'docker/**'
+              - 'docker-compose.yml'
+              - 'scripts/**'
+
+  # ==============================================
+  # SHARED DEPENDENCIES
+  # ==============================================
+  shared-setup:
+    name: Setup Shared Dependencies
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.shared == 'true' || needs.detect-changes.outputs.backend == 'true' || needs.detect-changes.outputs.frontend == 'true' || needs.detect-changes.outputs.mobile == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: shared/package-lock.json
+      
+      - name: Install shared dependencies
+        working-directory: ./shared
+        run: npm ci
+      
+      - name: Build shared packages
+        working-directory: ./shared
+        run: npm run build
+      
+      - name: Run shared tests
+        working-directory: ./shared
+        run: npm run test
+      
+      - name: Cache shared build
+        uses: actions/cache@v3
+        with:
+          path: shared/dist
+          key: shared-build-${{ github.sha }}
+          restore-keys: |
+            shared-build-
+
+  # ==============================================
+  # BACKEND PIPELINE
+  # ==============================================
+  backend-pipeline:
+    name: Backend Pipeline
+    needs: [detect-changes, shared-setup]
+    if: needs.detect-changes.outputs.backend == 'true'
+    uses: ./.github/workflows/backend-ci-cd.yml
+    secrets: inherit
+
+  # ==============================================
+  # FRONTEND PIPELINE
+  # ==============================================
+  frontend-pipeline:
+    name: Frontend Pipeline
+    needs: [detect-changes, shared-setup]
+    if: needs.detect-changes.outputs.frontend == 'true'
+    uses: ./.github/workflows/frontend-ci-cd.yml
+    secrets: inherit
+
+  # ==============================================
+  # MOBILE PIPELINE
+  # ==============================================
+  mobile-pipeline:
+    name: Mobile Pipeline
+    needs: [detect-changes, shared-setup]
+    if: needs.detect-changes.outputs.mobile == 'true'
+    uses: ./.github/workflows/mobile-ci-cd.yml
+    secrets: inherit
+
+  # ==============================================
+  # INTEGRATION TESTS
+  # ==============================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [backend-pipeline, frontend-pipeline]
+    if: always() && (needs.backend-pipeline.result == 'success' || needs.frontend-pipeline.result == 'success')
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: fitcoach_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Start services with Docker Compose
+        run: |
+          cp .env.example .env
+          docker-compose up -d --build
+          sleep 30  # Wait for services to be ready
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/fitcoach_test
+          REDIS_URL: redis://localhost:6379
+      
+      - name: Wait for services to be healthy
+        run: |
+          timeout 60 bash -c 'until curl -f http://localhost:3001/health; do sleep 2; done'
+          timeout 60 bash -c 'until curl -f http://localhost:5173; do sleep 2; done'
+      
+      - name: Run API integration tests
+        working-directory: ./tests
+        run: |
+          npm ci
+          npm run test:integration:api
+        env:
+          API_BASE_URL: http://localhost:3001
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/fitcoach_test
+      
+      - name: Run E2E tests
+        working-directory: ./tests
+        run: |
+          npx playwright install --with-deps
+          npm run test:e2e:full-stack
+        env:
+          FRONTEND_URL: http://localhost:5173
+          API_BASE_URL: http://localhost:3001
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: integration-test-results
+          path: |
+            tests/test-results
+            tests/playwright-report
+          retention-days: 7
+      
+      - name: Cleanup
+        if: always()
+        run: docker-compose down -v
+
+  # ==============================================
+  # PERFORMANCE TESTS
+  # ==============================================
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [backend-pipeline, frontend-pipeline]
+    if: github.ref == 'refs/heads/develop' && (needs.backend-pipeline.result == 'success' || needs.frontend-pipeline.result == 'success')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install Artillery
+        run: npm install -g artillery@latest
+      
+      - name: Run API performance tests
+        working-directory: ./tests/performance
+        run: |
+          artillery run api-load-test.yml --output api-report.json
+          artillery report api-report.json --output api-report.html
+        env:
+          TARGET_URL: https://fitcoach-api-staging.railway.app
+      
+      - name: Run Frontend performance tests
+        run: |
+          npm install -g lighthouse-ci
+          lhci autorun
+        env:
+          LHCI_BUILD_CONTEXT__CURRENT_HASH: ${{ github.sha }}
+          LHCI_BUILD_CONTEXT__COMMIT_TIME: ${{ github.event.head_commit.timestamp }}
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+      
+      - name: Upload performance reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-reports
+          path: |
+            tests/performance/*.html
+            .lighthouseci
+          retention-days: 30
+      
+      - name: Comment PR with performance results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let comment = `## ⚡ Performance Test Results\n\n`;
+            
+            // Add API performance results
+            try {
+              const apiReport = JSON.parse(fs.readFileSync('./tests/performance/api-report.json', 'utf8'));
+              const summary = apiReport.aggregate;
+              
+              comment += `### 🔧 API Performance\n`;
+              comment += `- **Response Time (p95)**: ${summary.latency.p95}ms\n`;
+              comment += `- **Requests/sec**: ${summary.rps.mean}\n`;
+              comment += `- **Error Rate**: ${(summary.errors / summary.requests * 100).toFixed(2)}%\n\n`;
+            } catch (e) {
+              comment += `### 🔧 API Performance\n❌ Could not parse API performance results\n\n`;
+            }
+            
+            comment += `### 📊 Detailed Reports\n`;
+            comment += `- [API Load Test Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n`;
+            comment += `- [Lighthouse Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  # ==============================================
+  # SECURITY SCAN (FULL STACK)
+  # ==============================================
+  security-scan:
+    name: Security Scan (Full Stack)
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run OWASP ZAP security scan
+        if: needs.detect-changes.outputs.backend == 'true' || needs.detect-changes.outputs.frontend == 'true'
+        run: |
+          docker run -v $(pwd):/zap/wrk/:rw -t owasp/zap2docker-stable zap-baseline.py \
+            -t https://fitcoach-staging.vercel.app \
+            -g gen.conf \
+            -r zap-report.html \
+            -J zap-report.json || true
+      
+      - name: Upload ZAP scan results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: zap-security-report
+          path: |
+            zap-report.html
+            zap-report.json
+          retention-days: 30
+
+  # ==============================================
+  # DEPLOYMENT COORDINATION
+  # ==============================================
+  coordinate-deployment:
+    name: Coordinate Deployment
+    runs-on: ubuntu-latest
+    needs: [backend-pipeline, frontend-pipeline, mobile-pipeline, integration-tests]
+    if: always() && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Check deployment status
+        run: |
+          echo "## 🚀 Deployment Status" > deployment-status.md
+          echo "" >> deployment-status.md
+          
+          # Backend
+          if [ "${{ needs.backend-pipeline.result }}" = "success" ]; then
+            echo "✅ **Backend**: Deployed successfully" >> deployment-status.md
+          else
+            echo "❌ **Backend**: Deployment failed" >> deployment-status.md
+          fi
+          
+          # Frontend
+          if [ "${{ needs.frontend-pipeline.result }}" = "success" ]; then
+            echo "✅ **Frontend**: Deployed successfully" >> deployment-status.md
+          else
+            echo "❌ **Frontend**: Deployment failed" >> deployment-status.md
+          fi
+          
+          # Mobile
+          if [ "${{ needs.mobile-pipeline.result }}" = "success" ]; then
+            echo "✅ **Mobile**: Deployed successfully" >> deployment-status.md
+          else
+            echo "❌ **Mobile**: Deployment failed" >> deployment-status.md
+          fi
+          
+          # Integration Tests
+          if [ "${{ needs.integration-tests.result }}" = "success" ]; then
+            echo "✅ **Integration Tests**: Passed" >> deployment-status.md
+          else
+            echo "❌ **Integration Tests**: Failed" >> deployment-status.md
+          fi
+          
+          echo "" >> deployment-status.md
+          echo "**Commit**: ${{ github.sha }}" >> deployment-status.md
+          echo "**Timestamp**: $(date -u)" >> deployment-status.md
+          
+          cat deployment-status.md
+      
+      - name: Create deployment summary
+        run: |
+          echo "DEPLOYMENT_SUCCESS=true" >> $GITHUB_ENV
+          
+          if [ "${{ needs.backend-pipeline.result }}" != "success" ] || \
+             [ "${{ needs.frontend-pipeline.result }}" != "success" ] || \
+             [ "${{ needs.integration-tests.result }}" != "success" ]; then
+            echo "DEPLOYMENT_SUCCESS=false" >> $GITHUB_ENV
+          fi
+      
+      - name: Notify deployment status
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          custom_payload: |
+            {
+              "text": "${{ env.DEPLOYMENT_SUCCESS == 'true' && '🎉 Full Stack Deployment Successful!' || '🚨 Full Stack Deployment Failed!' }}",
+              "attachments": [{
+                "color": "${{ env.DEPLOYMENT_SUCCESS == 'true' && 'good' || 'danger' }}",
+                "fields": [
+                  {
+                    "title": "Backend",
+                    "value": "${{ needs.backend-pipeline.result == 'success' && '✅ Success' || '❌ Failed' }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Frontend",
+                    "value": "${{ needs.frontend-pipeline.result == 'success' && '✅ Success' || '❌ Failed' }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Mobile",
+                    "value": "${{ needs.mobile-pipeline.result == 'success' && '✅ Success' || '❌ Failed' }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Integration Tests",
+                    "value": "${{ needs.integration-tests.result == 'success' && '✅ Passed' || '❌ Failed' }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Environment",
+                    "value": "Production",
+                    "short": true
+                  },
+                  {
+                    "title": "Commit",
+                    "value": "${{ github.sha }}",
+                    "short": true
+                  }
+                ]
+              }]
+            }
+
+  # ==============================================
+  # ROLLBACK (MANUAL TRIGGER)
+  # ==============================================
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: failure() && github.ref == 'refs/heads/main'
+    environment:
+      name: rollback-production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Rollback backend
+        run: |
+          echo "🔄 Rolling back backend deployment..."
+          # Add rollback logic for Railway/your backend platform
+      
+      - name: Rollback frontend
+        run: |
+          echo "🔄 Rolling back frontend deployment..."
+          # Add rollback logic for Vercel
+      
+      - name: Notify rollback
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          custom_payload: |
+            {
+              "text": "🔄 Rollback initiated for production deployment",
+              "attachments": [{
+                "color": "warning",
+                "fields": [{
+                  "title": "Reason",
+                  "value": "Deployment failure detected",
+                  "short": false
+                }, {
+                  "title": "Commit",
+                  "value": "${{ github.sha }}",
+                  "short": true
+                }]
+              }]
+            }

@@ -1,0 +1,497 @@
+name: Frontend CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-ci-cd.yml'
+      - 'shared/**'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-ci-cd.yml'
+      - 'shared/**'
+
+env:
+  NODE_VERSION: '18'
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+jobs:
+  # ==============================================
+  # TESTES E QUALIDADE DE CÓDIGO
+  # ==============================================
+  test:
+    name: Tests & Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: Install shared dependencies
+        working-directory: ./shared
+        run: npm ci
+      
+      - name: Lint code
+        working-directory: ./frontend
+        run: npm run lint
+      
+      - name: Type check
+        working-directory: ./frontend
+        run: npm run type-check
+      
+      - name: Run unit tests
+        working-directory: ./frontend
+        run: npm run test:unit
+        env:
+          VITE_API_URL: http://localhost:3001
+          VITE_APP_NAME: FitCoach Pro
+          VITE_ENVIRONMENT: test
+      
+      - name: Generate test coverage
+        working-directory: ./frontend
+        run: npm run test:coverage
+        env:
+          VITE_API_URL: http://localhost:3001
+          VITE_APP_NAME: FitCoach Pro
+          VITE_ENVIRONMENT: test
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./frontend/coverage/lcov.info
+          flags: frontend
+          name: frontend-coverage
+          fail_ci_if_error: false
+      
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: frontend
+
+  # ==============================================
+  # BUILD E TESTES E2E
+  # ==============================================
+  build-and-e2e:
+    name: Build & E2E Tests
+    runs-on: ubuntu-latest
+    needs: [test]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: Build application
+        working-directory: ./frontend
+        run: npm run build
+        env:
+          VITE_API_URL: https://fitcoach-api-staging.railway.app
+          VITE_APP_NAME: FitCoach Pro
+          VITE_ENVIRONMENT: staging
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: frontend-build
+          path: frontend/dist
+          retention-days: 7
+      
+      - name: Install Playwright
+        working-directory: ./frontend
+        run: npx playwright install --with-deps
+      
+      - name: Start preview server
+        working-directory: ./frontend
+        run: |
+          npm run preview &
+          sleep 10
+        env:
+          VITE_API_URL: https://fitcoach-api-staging.railway.app
+      
+      - name: Run E2E tests
+        working-directory: ./frontend
+        run: npm run test:e2e
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:4173
+      
+      - name: Upload E2E test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: e2e-test-results
+          path: frontend/test-results
+          retention-days: 7
+      
+      - name: Upload E2E screenshots
+        uses: actions/upload-artifact@v3
+        if: failure()
+        with:
+          name: e2e-screenshots
+          path: frontend/test-results/screenshots
+          retention-days: 7
+
+  # ==============================================
+  # ACCESSIBILITY TESTS
+  # ==============================================
+  accessibility:
+    name: Accessibility Tests
+    runs-on: ubuntu-latest
+    needs: [build-and-e2e]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-build
+          path: frontend/dist
+      
+      - name: Start preview server
+        working-directory: ./frontend
+        run: |
+          npm run preview &
+          sleep 10
+      
+      - name: Run accessibility tests
+        run: |
+          npm install -g @axe-core/cli
+          axe http://localhost:4173 --exit
+      
+      - name: Run Lighthouse CI
+        run: |
+          npm install -g @lhci/cli
+          lhci autorun
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+  # ==============================================
+  # SECURITY SCAN
+  # ==============================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: Run security audit
+        working-directory: ./frontend
+        run: npm audit --audit-level=high
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --file=frontend/package.json
+      
+      - name: Upload Snyk results to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
+  # ==============================================
+  # DEPLOY TO STAGING
+  # ==============================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-e2e, accessibility, security]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://fitcoach-staging.vercel.app
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+      
+      - name: Pull Vercel Environment Information
+        run: vercel pull --yes --environment=preview --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: ./frontend
+      
+      - name: Build Project Artifacts
+        run: vercel build --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: ./frontend
+        env:
+          VITE_API_URL: https://fitcoach-api-staging.railway.app
+          VITE_APP_NAME: FitCoach Pro
+          VITE_ENVIRONMENT: staging
+      
+      - name: Deploy Project Artifacts to Vercel
+        id: deploy
+        run: |
+          url=$(vercel deploy --prebuilt --token=${{ secrets.VERCEL_TOKEN }})
+          echo "preview-url=$url" >> $GITHUB_OUTPUT
+        working-directory: ./frontend
+      
+      - name: Assign custom domain
+        run: |
+          vercel alias ${{ steps.deploy.outputs.preview-url }} fitcoach-staging.vercel.app --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: ./frontend
+      
+      - name: Run smoke tests
+        run: |
+          sleep 30  # Wait for deployment
+          curl -f "https://fitcoach-staging.vercel.app" || exit 1
+          curl -f "https://fitcoach-staging.vercel.app/health" || exit 1
+      
+      - name: Comment PR with preview URL
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const comment = `## 🚀 Frontend Preview Deployed!
+            
+            **Preview URL**: https://fitcoach-staging.vercel.app
+            **Environment**: Staging
+            **Commit**: ${{ github.sha }}
+            
+            ### Quick Links
+            - 🏠 [Dashboard](https://fitcoach-staging.vercel.app/dashboard)
+            - 🔐 [Login](https://fitcoach-staging.vercel.app/login)
+            - 📱 [Mobile Preview](https://fitcoach-staging.vercel.app?mobile=true)
+            
+            ### Test Accounts
+            - **Personal Trainer**: trainer@test.com / Test123!
+            - **Admin**: admin@test.com / Admin123!`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+      
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+
+  # ==============================================
+  # DEPLOY TO PRODUCTION
+  # ==============================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-e2e, accessibility, security]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://dashboard.fitcoach.pro
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+      
+      - name: Pull Vercel Environment Information
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: ./frontend
+      
+      - name: Build Project Artifacts
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: ./frontend
+        env:
+          VITE_API_URL: https://api.fitcoach.pro
+          VITE_APP_NAME: FitCoach Pro
+          VITE_ENVIRONMENT: production
+      
+      - name: Deploy Project Artifacts to Vercel
+        id: deploy
+        run: |
+          url=$(vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
+          echo "production-url=$url" >> $GITHUB_OUTPUT
+        working-directory: ./frontend
+      
+      - name: Run smoke tests
+        run: |
+          sleep 60  # Wait for deployment
+          curl -f "https://dashboard.fitcoach.pro" || exit 1
+          curl -f "https://dashboard.fitcoach.pro/health" || exit 1
+      
+      - name: Create GitHub Release
+        if: success()
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: frontend-v${{ github.run_number }}
+          release_name: Frontend Release v${{ github.run_number }}
+          body: |
+            ## Frontend Release v${{ github.run_number }}
+            
+            **Deployed to Production**: https://dashboard.fitcoach.pro
+            **Commit**: ${{ github.sha }}
+            
+            ### Changes
+            ${{ github.event.head_commit.message }}
+            
+            ### Performance Metrics
+            - Lighthouse Score: [View Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            - Bundle Size: [View Analysis](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          draft: false
+          prerelease: false
+      
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+          custom_payload: |
+            {
+              "text": "🎨 Frontend deployed to Production!",
+              "attachments": [{
+                "color": "${{ job.status == 'success' && 'good' || 'danger' }}",
+                "fields": [{
+                  "title": "Status",
+                  "value": "${{ job.status }}",
+                  "short": true
+                }, {
+                  "title": "Environment",
+                  "value": "Production",
+                  "short": true
+                }, {
+                  "title": "URL",
+                  "value": "https://dashboard.fitcoach.pro",
+                  "short": false
+                }]
+              }]
+            }
+
+  # ==============================================
+  # VISUAL REGRESSION TESTS
+  # ==============================================
+  visual-regression:
+    name: Visual Regression Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: Install Playwright
+        working-directory: ./frontend
+        run: npx playwright install --with-deps
+      
+      - name: Run visual regression tests
+        working-directory: ./frontend
+        run: npm run test:visual
+        env:
+          PLAYWRIGHT_BASE_URL: https://fitcoach-staging.vercel.app
+      
+      - name: Upload visual diff artifacts
+        uses: actions/upload-artifact@v3
+        if: failure()
+        with:
+          name: visual-regression-diffs
+          path: frontend/test-results/visual-diffs
+          retention-days: 7
+      
+      - name: Comment PR with visual changes
+        if: github.event_name == 'pull_request' && failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const comment = `## 👀 Visual Regression Detected
+            
+            Visual differences were detected in this PR. Please review the changes:
+            
+            [📸 View Visual Diff Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            
+            If these changes are intentional, update the baseline screenshots by running:
+            \`\`\`bash
+            npm run test:visual -- --update-snapshots
+            \`\`\``;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
